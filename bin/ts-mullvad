@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""
+Tailscale Mullvad Toggle.
+
+A tiny, dependency-free controller for selecting Mullvad exit nodes exposed by
+Tailscale. It is designed to work as both a normal CLI and a SwiftBar backend.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+import urllib.error
+import urllib.request
+import webbrowser
+
+
+TAILSCALE_DOWNLOAD_URL = "https://tailscale.com/download"
+MULLVAD_DOCS_URL = "https://tailscale.com/docs/features/exit-nodes/mullvad-exit-nodes"
+MULLVAD_ADMIN_URL = "https://login.tailscale.com/admin/settings/general"
+MULLVAD_MARKETING_URL = "https://tailscale.com/mullvad"
+MULLVAD_CHECK_URL = "https://am.i.mullvad.net/json"
+DEFAULT_COUNTRY = os.environ.get("TS_MULLVAD_COUNTRY", "US")
+DEFAULT_CITY = os.environ.get("TS_MULLVAD_CITY", "")
+
+
+class UserFacingError(Exception):
+    pass
+
+
+def tailscale_bin():
+    configured = os.environ.get("TAILSCALE_BIN")
+    if configured and os.path.exists(configured):
+        return configured
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    for path in (
+        "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        "/opt/homebrew/bin/tailscale",
+        "/usr/local/bin/tailscale",
+    ):
+        if os.path.exists(path):
+            return path
+    raise UserFacingError(
+        "Tailscale CLI was not found. Install Tailscale first: "
+        + TAILSCALE_DOWNLOAD_URL
+    )
+
+
+def run(args, check=True, capture=True):
+    proc = subprocess.run(
+        args,
+        text=True,
+        capture_output=capture,
+        check=False,
+    )
+    if check and proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise UserFacingError(detail or f"Command failed: {' '.join(args)}")
+    return proc
+
+
+def tailscale_status():
+    proc = run([tailscale_bin(), "status", "--json"], check=False)
+    if proc.returncode != 0:
+        raise UserFacingError(
+            "Tailscale is installed, but status failed. Open Tailscale and sign in."
+        )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise UserFacingError("Could not parse `tailscale status --json`.") from exc
+
+
+def normalize_name(name):
+    return (name or "").rstrip(".")
+
+
+def is_mullvad_exit(peer):
+    dns = normalize_name(peer.get("DNSName"))
+    tags = peer.get("Tags") or []
+    return peer.get("ExitNodeOption") and (
+        ".mullvad.ts.net" in dns
+        or dns.endswith("mullvad.ts.net")
+        or "tag:mullvad-exit-node" in tags
+    )
+
+
+def peer_to_node(peer):
+    location = peer.get("Location") or {}
+    ips = peer.get("TailscaleIPs") or []
+    name = normalize_name(peer.get("DNSName")) or peer.get("HostName", "")
+    return {
+        "name": name,
+        "hostname": peer.get("HostName", ""),
+        "ip": ips[0] if ips else "",
+        "online": bool(peer.get("Online")),
+        "active": bool(peer.get("Active")),
+        "exit_node": bool(peer.get("ExitNode")),
+        "country": location.get("CountryCode", ""),
+        "country_name": location.get("Country", ""),
+        "city": location.get("City", ""),
+        "priority": location.get("Priority", 9999),
+    }
+
+
+def mullvad_nodes(status):
+    nodes = [peer_to_node(peer) for peer in (status.get("Peer") or {}).values() if is_mullvad_exit(peer)]
+    return sorted(nodes, key=node_sort_key)
+
+
+def node_sort_key(node):
+    priority = node.get("priority")
+    if not isinstance(priority, int):
+        priority = 9999
+    return (not node.get("online"), priority, node.get("country", ""), node.get("city", ""), node.get("name", ""))
+
+
+def current_exit(status):
+    for peer in (status.get("Peer") or {}).values():
+        if peer.get("ExitNode"):
+            return peer_to_node(peer)
+    return None
+
+
+def matches(node, country=None, city=None):
+    if country and country.lower() not in ("any", "*", "all"):
+        if (node.get("country") or "").upper() != country.upper():
+            return False
+    if city and city.lower() not in ("any", "*", "all"):
+        city_value = (node.get("city") or "").lower()
+        if city.lower() not in city_value:
+            return False
+    return True
+
+
+def choose_node(status, country=None, city=None, name=None):
+    nodes = mullvad_nodes(status)
+    if name:
+        needle = normalize_name(name)
+        for node in nodes:
+            if node["name"] == needle or node["hostname"] == needle or node["ip"] == needle:
+                return node
+        raise UserFacingError(f"No Mullvad exit node matched {name!r}.")
+
+    filtered = [node for node in nodes if matches(node, country, city)]
+    active = current_exit(status)
+    if active and matches(active, country, city):
+        for node in filtered:
+            if node["name"] == active["name"]:
+                return node
+    online = [node for node in filtered if node.get("online")]
+    if online:
+        return online[0]
+    if filtered:
+        return filtered[0]
+    if nodes:
+        wanted = []
+        if country:
+            wanted.append(country.upper())
+        if city:
+            wanted.append(city)
+        raise UserFacingError(
+            "Mullvad exit nodes exist, but none matched "
+            + (" / ".join(wanted) or "the requested filter")
+            + ". Run `ts-mullvad list --country any`."
+        )
+    raise UserFacingError(no_mullvad_message())
+
+
+def no_mullvad_message():
+    return textwrap.dedent(
+        f"""
+        No Mullvad exit nodes are visible in this tailnet yet.
+
+        What to do:
+          1. Open Tailscale Mullvad setup: {MULLVAD_ADMIN_URL}
+          2. Purchase or enable the Mullvad VPN add-on.
+          3. Grant this device access to Mullvad exit nodes.
+          4. Re-run: ts-mullvad doctor
+
+        Docs: {MULLVAD_DOCS_URL}
+        """
+    ).strip()
+
+
+def set_exit_node(node_name, allow_lan=True):
+    args = [tailscale_bin(), "set", f"--exit-node={node_name}"]
+    if allow_lan:
+        args.append("--exit-node-allow-lan-access=true")
+    run(args, capture=True)
+
+
+def clear_exit_node():
+    run([tailscale_bin(), "set", "--exit-node="], capture=True)
+
+
+def check_mullvad_json():
+    try:
+        with urllib.request.urlopen(MULLVAD_CHECK_URL, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise UserFacingError(f"Could not verify egress with {MULLVAD_CHECK_URL}: {exc}") from exc
+
+
+def cmd_status(args):
+    status = tailscale_status()
+    nodes = mullvad_nodes(status)
+    active = current_exit(status)
+    payload = {
+        "tailscale": status.get("BackendState"),
+        "tailnet": (status.get("CurrentTailnet") or {}).get("MagicDNSSuffix"),
+        "mullvad_nodes": len(nodes),
+        "current_exit": active,
+        "recommended": choose_node(status, args.country, args.city, args.node) if nodes else None,
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def cmd_list(args):
+    nodes = [node for node in mullvad_nodes(tailscale_status()) if matches(node, args.country, args.city)]
+    if args.json:
+        print(json.dumps(nodes, indent=2, sort_keys=True))
+        return
+    if not nodes:
+        print(no_mullvad_message())
+        return
+    for node in nodes:
+        state = "online" if node["online"] else "offline"
+        active = " active" if node["exit_node"] else ""
+        print(f"{node['name']:<34} {node['country']:<3} {node['city']:<18} {state}{active}")
+
+
+def cmd_on(args):
+    node = choose_node(tailscale_status(), args.country, args.city, args.node)
+    set_exit_node(node["name"], allow_lan=not args.no_lan)
+    print(f"Using Mullvad exit node: {node['name']} ({node['city']}, {node['country']})")
+
+
+def cmd_off(_args):
+    clear_exit_node()
+    print("Exit node cleared.")
+
+
+def cmd_toggle(args):
+    status = tailscale_status()
+    active = current_exit(status)
+    node = choose_node(status, args.country, args.city, args.node)
+    active_name = active["name"] if active else ""
+    if active_name == node["name"]:
+        clear_exit_node()
+        print("Exit node cleared.")
+    else:
+        set_exit_node(node["name"], allow_lan=not args.no_lan)
+        print(f"Using Mullvad exit node: {node['name']} ({node['city']}, {node['country']})")
+
+
+def cmd_verify(args):
+    data = check_mullvad_json()
+    if args.json:
+        print(json.dumps(data, indent=2, sort_keys=True))
+        return
+    print(f"IP: {data.get('ip', 'unknown')}")
+    print(f"Location: {data.get('country', 'unknown')} / {data.get('city', 'unknown')}")
+    print(f"Mullvad exit IP: {data.get('mullvad_exit_ip')}")
+    if data.get("mullvad_exit_ip_hostname"):
+        print(f"Mullvad hostname: {data.get('mullvad_exit_ip_hostname')}")
+
+
+def cmd_open_setup(_args):
+    webbrowser.open(MULLVAD_ADMIN_URL)
+    print(MULLVAD_ADMIN_URL)
+
+
+def cmd_doctor(_args):
+    print("Tailscale Mullvad Toggle doctor")
+    print()
+    try:
+        ts = tailscale_bin()
+        print(f"OK Tailscale CLI: {ts}")
+    except UserFacingError as exc:
+        print(f"NO {exc}")
+        return 1
+
+    try:
+        status = tailscale_status()
+        print(f"OK Tailscale state: {status.get('BackendState')}")
+        tailnet = (status.get("CurrentTailnet") or {}).get("MagicDNSSuffix")
+        if tailnet:
+            print(f"OK Tailnet: {tailnet}")
+    except UserFacingError as exc:
+        print(f"NO {exc}")
+        return 1
+
+    nodes = mullvad_nodes(status)
+    if not nodes:
+        print()
+        print(no_mullvad_message())
+        return 2
+
+    online = [node for node in nodes if node["online"]]
+    print(f"OK Mullvad nodes visible: {len(nodes)} total, {len(online)} online")
+    recommended = choose_node(status, DEFAULT_COUNTRY, DEFAULT_CITY or None, None)
+    print(f"OK Recommended: {recommended['name']} ({recommended['city']}, {recommended['country']})")
+    active = current_exit(status)
+    if active:
+        print(f"Current exit: {active['name']}")
+    else:
+        print("Current exit: none")
+    return 0
+
+
+def swiftbar_escape(value):
+    return str(value).replace("|", "-").replace("\n", " ")
+
+
+def cmd_menubar(args):
+    script = os.path.abspath(sys.argv[0])
+    try:
+        status = tailscale_status()
+        nodes = mullvad_nodes(status)
+        active = current_exit(status)
+        if nodes:
+            recommended = choose_node(status, args.country, args.city, args.node)
+            active_name = active["name"] if active else ""
+            if active_name == recommended["name"]:
+                print(f"Mullvad {recommended['country']} ON")
+            elif active:
+                print("Exit ON")
+            else:
+                print(f"Mullvad {recommended['country']} OFF")
+            print("---")
+            print(f"Recommended: {swiftbar_escape(recommended['name'])}")
+            print(f"Location: {swiftbar_escape(recommended['city'])}, {recommended['country']}")
+            print(f"Current exit: {swiftbar_escape(active_name or 'none')}")
+            print("---")
+            print(f"Toggle | bash={script} param1=toggle terminal=false refresh=true")
+            print(f"Turn On | bash={script} param1=on terminal=false refresh=true")
+            print(f"Turn Off | bash={script} param1=off terminal=false refresh=true")
+            print(f"Verify Egress | bash={script} param1=verify terminal=true refresh=false")
+            print(f"List Nodes | bash={script} param1=list terminal=true refresh=false")
+        else:
+            print("Mullvad Setup")
+            print("---")
+            print("No Mullvad exit nodes are visible yet.")
+            print(f"Open Tailscale Mullvad Setup | href={MULLVAD_ADMIN_URL}")
+            print(f"Read Setup Docs | href={MULLVAD_DOCS_URL}")
+            print(f"Doctor | bash={script} param1=doctor terminal=true refresh=true")
+    except UserFacingError as exc:
+        print("Tailscale Needed")
+        print("---")
+        print(swiftbar_escape(exc))
+        print(f"Install Tailscale | href={TAILSCALE_DOWNLOAD_URL}")
+        print(f"Doctor | bash={script} param1=doctor terminal=true refresh=true")
+
+
+def add_common_node_args(parser):
+    parser.add_argument("--country", default=DEFAULT_COUNTRY, help="Country code to prefer, e.g. US, DE, GB, or any.")
+    parser.add_argument("--city", default=DEFAULT_CITY, help="Optional city filter, e.g. New York.")
+    parser.add_argument("--node", default=os.environ.get("TS_MULLVAD_NODE", ""), help="Exact node DNS name, hostname, or Tailscale IP.")
+    parser.add_argument("--no-lan", action="store_true", help="Do not allow local LAN access while using the exit node.")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Toggle Tailscale Mullvad exit nodes.")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("doctor", help="Check Tailscale, Mullvad visibility, and setup links.")
+    p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("status", help="Print JSON status.")
+    add_common_node_args(p)
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("list", help="List visible Mullvad exit nodes.")
+    p.add_argument("--country", default="any")
+    p.add_argument("--city", default="")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("on", help="Use the best matching Mullvad exit node.")
+    add_common_node_args(p)
+    p.set_defaults(func=cmd_on)
+
+    p = sub.add_parser("off", help="Stop using an exit node.")
+    p.set_defaults(func=cmd_off)
+
+    p = sub.add_parser("toggle", help="Toggle the recommended Mullvad exit node.")
+    add_common_node_args(p)
+    p.set_defaults(func=cmd_toggle)
+
+    p = sub.add_parser("verify", help="Check public egress using Mullvad's checker.")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("open-setup", help="Open Tailscale's Mullvad setup page.")
+    p.set_defaults(func=cmd_open_setup)
+
+    p = sub.add_parser("menubar", help="Emit SwiftBar menu output.")
+    add_common_node_args(p)
+    p.set_defaults(func=cmd_menubar)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        result = args.func(args)
+        return int(result or 0)
+    except UserFacingError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
